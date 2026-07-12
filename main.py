@@ -23,6 +23,17 @@ BOT_TOKEN = os.getenv("TORRENT_BOT_TOKEN", "")
 
 # The shared group this bot hands finished uploads off to, and the fixed
 # marker line NovaFlix's bot looks for to recognize a trusted handoff.
+#
+# Using the group's public @username rather than its numeric chat ID --
+# Pyrogram has a known bug in its peer-ID classification logic
+# (get_peer_type / MIN_CHANNEL_ID) that intermittently raises "Peer id
+# invalid" for certain numeric supergroup IDs, even when the bot is
+# genuinely a member. Usernames resolve through a different code path
+# that isn't affected by this. The group must be set to public with this
+# username for this to work (see PIPELINE_GROUP_USERNAME below).
+PIPELINE_GROUP_USERNAME = os.getenv("PIPELINE_GROUP_USERNAME", "novaflix_pipeline")
+# Still used for the trust-check comparison on NovaFlix's side (see that
+# repo) -- kept here only as a fallback/reference, not used for sending.
 PIPELINE_GROUP_ID = int(os.getenv("PIPELINE_GROUP_ID", "-1004319667086"))
 DOODSTREAM_LINK_MARKER = "DOODSTREAM_LINK"
 
@@ -251,7 +262,7 @@ async def _start_download(client: Client, chat_id: int, file_index: int):
     handoff_text = f"{DOODSTREAM_LINK_MARKER}\n{dood_url}\n{original_name}"
 
     try:
-        await client.send_message(PIPELINE_GROUP_ID, handoff_text)
+        await _send_to_pipeline_group(client, handoff_text)
         await status_msg.edit_text(
             f"✅ **All done!** Uploaded and sent to the pipeline group:\n{dood_url}"
         )
@@ -262,6 +273,21 @@ async def _start_download(client: Client, chat_id: int, file_index: int):
             f"group automatically ({type(e).__name__}: {e}). You can forward this link to "
             "the NovaFlix bot manually."
         )
+
+
+async def _send_to_pipeline_group(client: Client, text: str):
+    """Send a message to the shared pipeline group, addressed by its
+    public @username rather than numeric chat ID.
+
+    Numeric supergroup IDs (the long -100... prefixed ones) have hit a
+    known Pyrogram peer-resolution bug in testing here -- send_message()
+    intermittently raises "Peer id invalid" even when the bot is a
+    genuine member, seemingly tied to how Pyrogram classifies certain ID
+    ranges internally. Usernames resolve through a different, unaffected
+    code path, which is why the group was switched to public with a
+    fixed username specifically to work around this.
+    """
+    await client.send_message(f"@{PIPELINE_GROUP_USERNAME}", text)
 
 
 def _cleanup_session(session: "torrent_engine.TorrentSession"):
