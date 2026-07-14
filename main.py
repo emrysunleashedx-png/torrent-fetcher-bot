@@ -10,6 +10,7 @@ from pyrogram.types import Message
 
 import torrent_engine
 import doodstream_upload
+import firestore_handoff
 
 logging.basicConfig(
     level=logging.INFO,
@@ -20,22 +21,6 @@ logger = logging.getLogger("torrent_fetcher_bot")
 API_ID = int(os.getenv("TELEGRAM_API_ID", "0"))
 API_HASH = os.getenv("TELEGRAM_API_HASH", "")
 BOT_TOKEN = os.getenv("TORRENT_BOT_TOKEN", "")
-
-# The shared group this bot hands finished uploads off to, and the fixed
-# marker line NovaFlix's bot looks for to recognize a trusted handoff.
-#
-# Using the group's public @username rather than its numeric chat ID --
-# Pyrogram has a known bug in its peer-ID classification logic
-# (get_peer_type / MIN_CHANNEL_ID) that intermittently raises "Peer id
-# invalid" for certain numeric supergroup IDs, even when the bot is
-# genuinely a member. Usernames resolve through a different code path
-# that isn't affected by this. The group must be set to public with this
-# username for this to work (see PIPELINE_GROUP_USERNAME below).
-PIPELINE_GROUP_USERNAME = os.getenv("PIPELINE_GROUP_USERNAME", "novaflix_pipeline")
-# Still used for the trust-check comparison on NovaFlix's side (see that
-# repo) -- kept here only as a fallback/reference, not used for sending.
-PIPELINE_GROUP_ID = int(os.getenv("PIPELINE_GROUP_ID", "-1004319667086"))
-DOODSTREAM_LINK_MARKER = "DOODSTREAM_LINK"
 
 DOWNLOAD_DIR = os.getenv("TORRENT_DOWNLOAD_DIR", "/tmp/torrent_downloads")
 
@@ -256,38 +241,26 @@ async def _start_download(client: Client, chat_id: int, file_index: int):
         await status_msg.edit_text(f"❌ Doodstream upload failed: {dood_url}")
         return
 
-    await status_msg.edit_text(f"✅ Uploaded! {dood_url}\n\nSending to the pipeline group...")
+    await status_msg.edit_text(f"✅ Uploaded! {dood_url}\n\nHanding off to the site pipeline...")
 
     original_name = os.path.basename(chosen_file["path"])
-    handoff_text = f"{DOODSTREAM_LINK_MARKER}\n{dood_url}\n{original_name}"
 
     try:
-        await _send_to_pipeline_group(client, handoff_text)
-        await status_msg.edit_text(
-            f"✅ **All done!** Uploaded and sent to the pipeline group:\n{dood_url}"
+        doc_id = await asyncio.to_thread(
+            firestore_handoff.write_pending_upload, dood_url, original_name, chat_id
         )
-    except Exception as e:
-        logger.exception("Failed to post handoff message to pipeline group")
         await status_msg.edit_text(
-            f"⚠️ Uploaded successfully ({dood_url}) but couldn't post it to the pipeline "
-            f"group automatically ({type(e).__name__}: {e}). You can forward this link to "
+            f"✅ **All done!** Uploaded and queued for publishing:\n{dood_url}\n\n"
+            "NovaFlix Media Router will pick this up shortly and message you there to /confirm."
+        )
+        logger.info("Handoff written to Firestore as doc %s", doc_id)
+    except Exception as e:
+        logger.exception("Failed to write handoff to Firestore")
+        await status_msg.edit_text(
+            f"⚠️ Uploaded successfully ({dood_url}) but couldn't queue it for publishing "
+            f"automatically ({type(e).__name__}: {e}). You can forward this link to "
             "the NovaFlix bot manually."
         )
-
-
-async def _send_to_pipeline_group(client: Client, text: str):
-    """Send a message to the shared pipeline group, addressed by its
-    public @username rather than numeric chat ID.
-
-    Numeric supergroup IDs (the long -100... prefixed ones) have hit a
-    known Pyrogram peer-resolution bug in testing here -- send_message()
-    intermittently raises "Peer id invalid" even when the bot is a
-    genuine member, seemingly tied to how Pyrogram classifies certain ID
-    ranges internally. Usernames resolve through a different, unaffected
-    code path, which is why the group was switched to public with a
-    fixed username specifically to work around this.
-    """
-    await client.send_message(f"@{PIPELINE_GROUP_USERNAME}", text)
 
 
 def _cleanup_session(session: "torrent_engine.TorrentSession"):
@@ -314,6 +287,13 @@ if __name__ == "__main__":
     import http.server
     import socketserver
     import threading
+
+    try:
+        firestore_handoff.init_firebase()
+    except Exception as e:
+        logger.error("Firebase init failed: %s", e)
+        logger.error("Downloads/uploads will still work, but finished links won't be "
+                      "queued for NovaFlix to pick up until FIREBASE_SERVICE_ACCOUNT_PATH is fixed.")
 
     def run_dummy_server():
         port = int(os.getenv("PORT", "8000"))
